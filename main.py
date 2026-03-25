@@ -9,6 +9,7 @@ Apify Lead Generation category — highest revenue on the platform.
 
 import asyncio
 import json
+import os
 import re
 import sys
 from urllib.parse import urlparse
@@ -134,13 +135,21 @@ async def enrich_batch(places: list[dict], level: str, apify_client) -> list[dic
 # ── Apify Actor entry point ─────────────────────────────────────────────────
 
 async def main():
-    if Apify:
-        actor = Apify()
-        event = await actor.get_event()
-        input_data = event.get("input", {})
-    else:
-        # Standalone mode for local testing
-        input_data = json.loads(sys.stdin.read()) if not sys.stdin.isatty() else {}
+    input_data = {}
+    # Try environment variable first (Apify platform sets this)
+    if os.getenv("APIFY_INPUT"):
+        try:
+            input_data = json.loads(os.getenv("APIFY_INPUT"))
+        except Exception:
+            pass
+    # Fallback to stdin (for local testing or direct invocation)
+    if not input_data:
+        try:
+            stdin_content = sys.stdin.read()
+            if stdin_content.strip():
+                input_data = json.loads(stdin_content)
+        except Exception:
+            pass
 
     places = input_data.get("googleMapsData", [])
     level  = input_data.get("enrichmentLevel", "basic")
@@ -151,9 +160,14 @@ async def main():
 
     results = await enrich_batch(places, level, None)
 
-    # Save to default dataset
-    if Apify:
-        await actor.push_data(results)
+    # Save to default dataset (if Apify SDK is available)
+    if os.getenv("APIFY_TOKEN"):
+        try:
+            from Apify import Apify
+            actor = Apify()
+            await actor.push_data(results)
+        except Exception:
+            pass
 
     print(json.dumps({"status": "ok", "inputCount": len(places), "outputCount": len(results)}, indent=2))
 
