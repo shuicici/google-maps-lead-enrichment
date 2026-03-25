@@ -1,0 +1,30 @@
+{
+  "actorSpecification": 1,
+  "name": "google-maps-lead-enrichment",
+  "title": "Google Maps Lead Enrichment",
+  "description": "Enrich Google Maps business data with emails, phones, social media, and contact info. The ultimate B2B lead generation tool.",
+  "version": "1.0.0",
+  "buildTag": "latest",
+  "categories": ["BUSINESS_INTELLIGENCE", "LEAD_GENERATION"],
+  "input": {
+    "type": "object",
+    "properties": {
+      "googleMapsData": {
+        "type": "array",
+        "description": "Array of Google Maps place objects (from google-maps-scraper output)"
+      },
+      "enrichmentLevel": {
+        "type": "string",
+        "enum": ["basic", "full"],
+        "default": "basic",
+        "description": "basic: phone+website | full: +emails, social, contacts"
+      }
+    },
+    "required": ["googleMapsData"]
+  },
+  "storage": {
+    "dataset": {
+      "description": "Enriched lead records"
+    }
+  }
+}
