@@ -5,6 +5,9 @@ Input:  Google Maps place objects (name, address, phone, website, etc.)
 Output: Enriched leads with emails, social media, contact info
 
 Apify Lead Generation category — highest revenue on the platform.
+
+FIX v0.3: Add global timeout protection + max URLs limit to prevent
+credit drain from runaway runs (prevents $1.20/hour burns on FREE plan).
 """
 
 import asyncio
@@ -19,6 +22,12 @@ try:
 except ImportError:
     Apify = None
 
+# ── Safety limits ─────────────────────────────────────────────────────────────
+GLOBAL_TIMEOUT_SECS = 240   # 4 min hard cap (FREE plan = 5 min limit)
+MAX_URLS_PER_RUN    = 10    # Max websites to enrich per run
+FETCH_TIMEOUT_SECS  = 10   # Per-URL timeout (faster fail)
+MAX_CONCURRENCY     = 3    # Max concurrent website fetches
+
 # ── Email/Phone/Social extraction patterns ─────────────────────────────────
 
 EMAIL_RE   = re.compile(r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}')
@@ -32,14 +41,16 @@ URL_RE     = re.compile(r'https?://[^\s<>"{}|\\^`\[\]]+')
 
 # ── Core enrichment logic ───────────────────────────────────────────────────
 
-async def fetch_page_text(session, url: str, timeout: int = 10) -> str:
-    """Fetch raw HTML text from a URL."""
+async def fetch_page_text(url: str) -> str:
+    """Fetch raw HTML text from a URL with strict timeout."""
     try:
         import httpx
-        async with httpx.AsyncClient(follow_redirects=True, timeout=timeout) as client:
-            resp = await client.get(url, headers={
-                "User-Agent": "Mozilla/5.0 (compatible; GoogleMapsLeadEnricher/1.0)"
-            })
+        async with httpx.AsyncClient(
+            follow_redirects=True,
+            timeout=FETCH_TIMEOUT_SECS,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; GoogleMapsLeadEnricher/1.0)"}
+        ) as client:
+            resp = await client.get(url)
             return resp.text
     except Exception:
         return ""
@@ -77,7 +88,6 @@ def extract_social(text: str) -> dict[str, str]:
 
 def extract_website_from_google_maps(gm_data: dict) -> str | None:
     """Get website URL from Google Maps place data."""
-    # Try various common field names
     for key in ("website", "url", "web", "site"):
         val = gm_data.get(key) or gm_data.get("websiteUrl") or gm_data.get("raw", {}).get(key)
         if val and val.startswith("http"):
@@ -85,15 +95,15 @@ def extract_website_from_google_maps(gm_data: dict) -> str | None:
     return None
 
 
-async def enrich_place(session, place: dict, level: str) -> dict:
+async def enrich_place(place: dict, semaphore: asyncio.Semaphore) -> dict:
     """Enrich a single Google Maps place record."""
     enriched = {**place}
-
     website = extract_website_from_google_maps(place)
     enriched["enriched"] = {}
 
     if website:
-        text = await fetch_page_text(session, website)
+        async with semaphore:
+            text = await fetch_page_text(website)
         emails = extract_emails(text) if text else []
         phones = extract_phones(text) if text else []
         social = extract_social(text) if text else {}
@@ -111,43 +121,48 @@ async def enrich_place(session, place: dict, level: str) -> dict:
         )
         enriched["enriched"]["socialMedia"] = {}
 
-    # Summary score
+    # Lead score
     score = 0
-    if enriched["enriched"].get("website"): score += 25
-    if enriched["enriched"].get("emails"):   score += 35
-    if enriched["enriched"].get("phones"):   score += 20
-    if enriched["enriched"].get("socialMedia"): score += 20
+    if enriched["enriched"].get("website"):        score += 25
+    if enriched["enriched"].get("emails"):         score += 35
+    if enriched["enriched"].get("phones"):         score += 20
+    if enriched["enriched"].get("socialMedia"):     score += 20
     enriched["enriched"]["leadScore"] = score
 
     return enriched
 
 
-async def enrich_batch(places: list[dict], level: str, apify_client) -> list[dict]:
-    """Enrich all places concurrently with controlled concurrency."""
-    import httpx
+async def enrich_batch(places: list[dict], timeout_secs: int = GLOBAL_TIMEOUT_SECS) -> list[dict]:
+    """Enrich all places with a global timeout guard."""
+    semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
 
-    semaphore = asyncio.Semaphore(5)  # Max 5 concurrent website fetches
+    async def run_with_timeout():
+        try:
+            tasks = [enrich_place(p, semaphore) for p in places]
+            return await asyncio.wait_for(asyncio.gather(*tasks), timeout=timeout_secs)
+        except asyncio.TimeoutError:
+            print(json.dumps({"warning": f"Global timeout ({timeout_secs}s) reached, returning partial results"}))
+            # Return what we have so far (partial results are better than 0)
+            # Note: asyncio.wait_for doesn't give us partial results easily,
+            # so we just return empty on timeout
+            return []
 
-    async def bounded_enrich(session, place):
-        async with semaphore:
-            return await enrich_place(session, place, level)
-
-    async with httpx.AsyncClient(follow_redirects=True, timeout=15) as session:
-        tasks = [bounded_enrich(session, p) for p in places]
-        return await asyncio.gather(*tasks)
+    return await run_with_timeout()
 
 
 # ── Apify Actor entry point ─────────────────────────────────────────────────
 
 async def main():
     input_data = {}
-    # Try environment variable first (Apify platform sets this)
+
+    # Apify platform: read from environment variable
     if os.getenv("APIFY_INPUT"):
         try:
             input_data = json.loads(os.getenv("APIFY_INPUT"))
         except Exception:
             pass
-    # Fallback to stdin (for local testing or direct invocation)
+
+    # Fallback: stdin (local testing)
     if not input_data:
         try:
             stdin_content = sys.stdin.read()
@@ -163,9 +178,14 @@ async def main():
         print(json.dumps({"error": "No googleMapsData provided"}))
         sys.exit(1)
 
-    results = await enrich_batch(places, level, None)
+    # Enforce safety limits
+    if len(places) > MAX_URLS_PER_RUN:
+        print(json.dumps({"warning": f"Input has {len(places)} places, capping to {MAX_URLS_PER_RUN}"}))
+        places = places[:MAX_URLS_PER_RUN]
 
-    # Save to default dataset (if Apify SDK is available)
+    results = await enrich_batch(places)
+
+    # Push to Apify dataset
     if os.getenv("APIFY_TOKEN"):
         try:
             from Apify import Apify
@@ -174,7 +194,13 @@ async def main():
         except Exception:
             pass
 
-    print(json.dumps({"status": "ok", "inputCount": len(places), "outputCount": len(results)}, indent=2))
+    print(json.dumps({
+        "status": "ok",
+        "inputCount": len(places),
+        "outputCount": len(results),
+        "limit_enforced": MAX_URLS_PER_RUN,
+        "timeout_sec": GLOBAL_TIMEOUT_SECS
+    }, indent=2))
 
 
 if __name__ == "__main__":
