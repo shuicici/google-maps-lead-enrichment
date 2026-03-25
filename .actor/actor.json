@@ -3,7 +3,7 @@
   "name": "google-maps-lead-enrichment",
   "title": "Google Maps Lead Enrichment",
   "description": "Enrich Google Maps business data with emails, phones, social media, and contact info. The ultimate B2B lead generation tool.",
-  "version": "0.0",
+  "version": "0.1",
   "buildTag": "latest",
   "categories": ["BUSINESS_INTELLIGENCE", "LEAD_GENERATION"]
 }

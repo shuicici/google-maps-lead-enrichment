@@ -123,12 +123,17 @@ async def enrich_place(session, place: dict, level: str) -> dict:
 
 
 async def enrich_batch(places: list[dict], level: str, apify_client) -> list[dict]:
-    """Enrich all places concurrently."""
+    """Enrich all places concurrently with controlled concurrency."""
     import httpx
 
-    connector = httpx.AsyncHTTPConnectionPool(timeout=15)
-    async with httpx.AsyncClient(transport=connector) as session:
-        tasks = [enrich_place(session, p, level) for p in places]
+    semaphore = asyncio.Semaphore(5)  # Max 5 concurrent website fetches
+
+    async def bounded_enrich(session, place):
+        async with semaphore:
+            return await enrich_place(session, place, level)
+
+    async with httpx.AsyncClient(follow_redirects=True, timeout=15) as session:
+        tasks = [bounded_enrich(session, p) for p in places]
         return await asyncio.gather(*tasks)
 
 
